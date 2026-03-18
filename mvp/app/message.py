@@ -1,4 +1,5 @@
-from mvp.app.forecast_generator import generate_forecast_text, predict_today_sunset
+from mvp.app.forecast_generator import generate_forecast_text
+from mvp.app.predict import predict_today_sunset
 import os
 import requests
 #========== CONFIG ==========
