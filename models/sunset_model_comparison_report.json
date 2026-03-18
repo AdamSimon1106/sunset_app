@@ -1,0 +1,61 @@
+{
+  "best_model_type": "classification",
+  "regression_metrics": {
+    "model_family": "regression",
+    "cv_mae_mean": 1.3930076624170966,
+    "cv_mae_std": 0.052556470297620034,
+    "cv_r2_mean": 0.1126304939303078,
+    "cv_r2_std": 0.0345616600953617,
+    "test_mae": 1.3527375728124205,
+    "test_r2": 0.1587489519960703,
+    "bucketed_accuracy": 0.3783783783783784,
+    "bucketed_f1_macro": 0.32108750819310317,
+    "bucketed_f1_weighted": 0.3138353274789975,
+    "classification_report": "              precision    recall  f1-score   support\n\n         bad     0.5000    0.1864    0.2716        59\n          ok     0.3393    0.8333    0.4822       114\n       great     0.6452    0.1250    0.2094       160\n\n    accuracy                         0.3784       333\n   macro avg     0.4948    0.3816    0.3211       333\nweighted avg     0.5147    0.3784    0.3138       333\n",
+    "confusion_matrix": [
+      [
+        11,
+        46,
+        2
+      ],
+      [
+        10,
+        95,
+        9
+      ],
+      [
+        1,
+        139,
+        20
+      ]
+    ]
+  },
+  "classification_metrics": {
+    "model_family": "classification",
+    "cv_accuracy_mean": 0.5169102000283728,
+    "cv_accuracy_std": 0.022312728208409703,
+    "cv_f1_macro_mean": 0.43031955437680336,
+    "cv_f1_macro_std": 0.016300997953413235,
+    "bucketed_accuracy": 0.5465465465465466,
+    "bucketed_f1_macro": 0.5094241092211894,
+    "bucketed_f1_weighted": 0.5491561144380414,
+    "classification_report": "              precision    recall  f1-score   support\n\n         bad     0.3731    0.4237    0.3968        59\n          ok     0.4732    0.4649    0.4690       114\n       great     0.6753    0.6500    0.6624       160\n\n    accuracy                         0.5465       333\n   macro avg     0.5072    0.5129    0.5094       333\nweighted avg     0.5526    0.5465    0.5492       333\n",
+    "confusion_matrix": [
+      [
+        25,
+        22,
+        12
+      ],
+      [
+        23,
+        53,
+        38
+      ],
+      [
+        19,
+        37,
+        104
+      ]
+    ]
+  }
+}
