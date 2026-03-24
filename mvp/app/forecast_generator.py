@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from predict import predict_today_sunset
+from mvp.app.predict import predict_today_sunset
 
 # ================== CONFIG ===================
 DEFAULT_MODEL = "gemini-2.5-flash"
