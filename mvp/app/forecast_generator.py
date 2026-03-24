@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from mvp.app.predict import predict_today_sunset
+from predict import predict_today_sunset
 
 
 # ================== CONFIG ===================
@@ -102,7 +102,7 @@ def generate_forecast_text(
         temperature=0.4,
     )
 
-   prompt = ChatPromptTemplate.from_messages(
+    prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
@@ -176,6 +176,7 @@ def generate_forecast_text(
             ),
         ]
     )
+
     chain = prompt | llm
     response = chain.invoke(
         {
