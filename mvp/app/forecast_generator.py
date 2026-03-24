@@ -10,7 +10,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from predict import predict_today_sunset
 
-
 # ================== CONFIG ===================
 DEFAULT_MODEL = "gemini-2.5-flash"
 
@@ -89,8 +88,8 @@ def build_llm_weather_payload(prediction_result: dict[str, Any]) -> dict[str, An
 
 # ================== LLM GENERATION ===================
 def generate_forecast_text(
-    prediction_result: dict[str, Any],
-    model_name: str = DEFAULT_MODEL,
+        prediction_result: dict[str, Any],
+        model_name: str = DEFAULT_MODEL,
 ) -> str:
     if not os.getenv("GOOGLE_API_KEY"):
         raise RuntimeError("Missing GOOGLE_API_KEY environment variable")
