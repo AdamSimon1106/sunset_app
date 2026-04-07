@@ -2,12 +2,14 @@ name: Daily Sunset Forecast
 
 on:
   schedule:
-    - cron: "0 8 * * *"
+    - cron: "7 12 * * *"
+      timezone: "Asia/Jerusalem"
   workflow_dispatch:
 
 jobs:
   run-forecast:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repo
