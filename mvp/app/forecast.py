@@ -1,5 +1,3 @@
-# app/forecast.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,10 +6,25 @@ from typing import Any, Optional
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 REQUEST_TIMEOUT_SECONDS = 30
+
+
+class ForecastError(Exception):
+    """Base exception for forecast-building failures."""
+
+
+class DataUnavailableError(ForecastError):
+    """Raised when an external API cannot provide required data."""
+
+
+class ModelInputError(ForecastError):
+    """Raised when model input cannot be assembled correctly."""
+
 
 # These are the only raw features your selected model needs
 PREDICT_FEATURE_COLUMNS = [
@@ -48,6 +61,27 @@ class ForecastBuildResult:
         }
 
 
+def _build_retry_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        allowed_methods=frozenset(["GET"]),
+        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=1.0,
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def _safe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -65,7 +99,7 @@ def _parse_iso_datetime(value: str) -> datetime:
 
 def _find_closest_row(df: pd.DataFrame, target_dt: datetime) -> pd.Series:
     if df.empty:
-        raise ValueError("DataFrame is empty.")
+        raise ModelInputError("DataFrame is empty.")
 
     temp = df.copy()
     temp["seconds_from_target"] = (
@@ -92,7 +126,68 @@ def _find_row_at_or_before(df: pd.DataFrame, target_dt: datetime) -> Optional[pd
     return eligible.loc[idx]
 
 
-def _fetch_weather_forecast(latitude: float, longitude: float, target_date: str, timezone: str) -> dict[str, Any]:
+def _log_request_failure(api_name: str, attempt: int, exc: Exception) -> None:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    print(
+        f"[forecast] {api_name} request failed "
+        f"attempt={attempt}/3 status={status_code} error={exc}"
+    )
+
+
+def _request_json_with_retries(
+    url: str,
+    params: dict[str, Any],
+    api_name: str,
+) -> dict[str, Any]:
+    session = _build_retry_session()
+    last_error: Exception | None = None
+
+    for attempt in range(1, 4):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=(10, REQUEST_TIMEOUT_SECONDS),
+            )
+
+            if response.status_code >= 400:
+                body_preview = response.text[:300].replace("\n", " ")
+                raise requests.HTTPError(
+                    f"{api_name} error status={response.status_code} body={body_preview}",
+                    response=response,
+                )
+
+            return response.json()
+
+        except (
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.HTTPError,
+            requests.RequestException,
+        ) as exc:
+            last_error = exc
+            _log_request_failure(api_name=api_name, attempt=attempt, exc=exc)
+
+            if attempt < 3:
+                continue
+
+    raise DataUnavailableError(
+        f"Failed to fetch data from {api_name} after retries: {last_error}"
+    )
+
+
+def _require_keys(data: dict[str, Any], required_keys: list[str], context: str) -> None:
+    missing = [key for key in required_keys if key not in data]
+    if missing:
+        raise DataUnavailableError(f"Missing keys in {context}: {missing}")
+
+
+def _fetch_weather_forecast(
+    latitude: float,
+    longitude: float,
+    target_date: str,
+    timezone: str,
+) -> dict[str, Any]:
     params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -116,17 +211,25 @@ def _fetch_weather_forecast(latitude: float, longitude: float, target_date: str,
         "daily": "sunset",
     }
 
-    response = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
+    data = _request_json_with_retries(
+        url=OPEN_METEO_FORECAST_URL,
+        params=params,
+        api_name="open-meteo forecast",
+    )
 
-    if "hourly" not in data or "daily" not in data:
-        raise ValueError("Weather forecast API response missing 'hourly' or 'daily'.")
+    _require_keys(data, ["hourly", "daily"], "weather forecast response")
+    _require_keys(data["hourly"], ["time"], "weather forecast hourly")
+    _require_keys(data["daily"], ["sunset"], "weather forecast daily")
 
     return data
 
 
-def _fetch_air_quality_forecast(latitude: float, longitude: float, target_date: str, timezone: str) -> dict[str, Any]:
+def _fetch_air_quality_forecast(
+    latitude: float,
+    longitude: float,
+    target_date: str,
+    timezone: str,
+) -> dict[str, Any]:
     params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -142,12 +245,18 @@ def _fetch_air_quality_forecast(latitude: float, longitude: float, target_date: 
         ),
     }
 
-    response = requests.get(OPEN_METEO_AIR_QUALITY_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
+    data = _request_json_with_retries(
+        url=OPEN_METEO_AIR_QUALITY_URL,
+        params=params,
+        api_name="open-meteo air-quality",
+    )
 
-    if "hourly" not in data:
-        raise ValueError("Air quality API response missing 'hourly'.")
+    _require_keys(data, ["hourly"], "air quality response")
+    _require_keys(
+        data["hourly"],
+        ["time", "pm2_5", "pm10", "aerosol_optical_depth"],
+        "air quality hourly",
+    )
 
     return data
 
@@ -168,7 +277,7 @@ def _build_weather_df(hourly_data: dict[str, list[Any]]) -> pd.DataFrame:
     ]
     missing = [k for k in required if k not in hourly_data]
     if missing:
-        raise ValueError(f"Weather hourly data missing keys: {missing}")
+        raise ModelInputError(f"Weather hourly data missing keys: {missing}")
 
     df = pd.DataFrame(
         {
@@ -193,7 +302,7 @@ def _build_air_quality_df(hourly_data: dict[str, list[Any]]) -> pd.DataFrame:
     required = ["time", "pm2_5", "pm10", "aerosol_optical_depth"]
     missing = [k for k in required if k not in hourly_data]
     if missing:
-        raise ValueError(f"Air quality hourly data missing keys: {missing}")
+        raise ModelInputError(f"Air quality hourly data missing keys: {missing}")
 
     df = pd.DataFrame(
         {
@@ -307,7 +416,7 @@ def build_today_model_input(
 
     sunset_values = weather_data["daily"].get("sunset", [])
     if not sunset_values:
-        raise ValueError("No sunset time returned for requested date.")
+        raise DataUnavailableError("No sunset time returned for requested date.")
 
     sunset_dt = _parse_iso_datetime(sunset_values[0])
 
@@ -335,7 +444,7 @@ def build_today_model_input(
     }
 
     if fail_on_missing and missing_fields:
-        raise ValueError(
+        raise ModelInputError(
             "Missing required model features for today's forecast: "
             + ", ".join(missing_fields)
         )
