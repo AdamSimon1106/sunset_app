@@ -5,10 +5,16 @@ from pathlib import Path
 from typing import Any
 
 import joblib
-import pandas as pd
 
-from mvp.app.forecast import build_today_model_input
-from mvp.app.model_preprocessing import WeatherPreprocessor
+from mvp.app.forecast import (
+    DataUnavailableError,
+    ModelInputError,
+    build_today_model_input,
+)
+
+
+class PredictionError(Exception):
+    """Raised when model loading or prediction fails."""
 
 
 # ================== CONFIG ===================
@@ -17,20 +23,24 @@ PATH_TO_MODEL = Path(__file__).resolve().parent.parent / "models" / "sunset_best
 
 # ================== LOAD MODEL BUNDLE ===================
 def load_bundle(path: Path = PATH_TO_MODEL) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Model bundle not found: {path}")
+    try:
+        if not path.exists():
+            raise FileNotFoundError(f"Model bundle not found: {path}")
 
-    bundle = joblib.load(path)
+        bundle = joblib.load(path)
 
-    if not isinstance(bundle, dict):
-        raise ValueError("Model file must contain a dict bundle.")
+        if not isinstance(bundle, dict):
+            raise ValueError("Model file must contain a dict bundle.")
 
-    required_keys = {"best_model_type", "pipeline", "raw_feature_columns"}
-    missing_keys = required_keys - set(bundle.keys())
-    if missing_keys:
-        raise ValueError(f"Model bundle missing keys: {sorted(missing_keys)}")
+        required_keys = {"best_model_type", "pipeline", "raw_feature_columns"}
+        missing_keys = required_keys - set(bundle.keys())
+        if missing_keys:
+            raise ValueError(f"Model bundle missing keys: {sorted(missing_keys)}")
 
-    return bundle
+        return bundle
+
+    except Exception as exc:
+        raise PredictionError(f"Failed to load model bundle: {exc}") from exc
 
 
 # ================== HELPERS ===================
@@ -41,7 +51,7 @@ def class_to_label(class_id: int) -> str:
         3: "great",
     }
     if class_id not in mapping:
-        raise ValueError(f"Unknown class id: {class_id}")
+        raise PredictionError(f"Unknown class id: {class_id}")
     return mapping[class_id]
 
 
@@ -63,86 +73,94 @@ def predict_today_sunset(
     timezone: str = "auto",
     target_date: str | None = None,
 ) -> dict[str, Any]:
-    bundle = load_bundle()
+    try:
+        bundle = load_bundle()
 
-    model_type = bundle["best_model_type"]
-    pipeline = bundle["pipeline"]
-    raw_feature_columns = bundle["raw_feature_columns"]
+        model_type = bundle["best_model_type"]
+        pipeline = bundle["pipeline"]
+        raw_feature_columns = bundle["raw_feature_columns"]
 
-    forecast_result = build_today_model_input(
-        city_name=city_name,
-        latitude=latitude,
-        longitude=longitude,
-        feature_columns=raw_feature_columns,
-        timezone=timezone,
-        target_date=target_date,
-        fail_on_missing=False,
-    )
-
-    sunset_time_today = forecast_result["sunset_time_today"]
-    snapshot = forecast_result["snapshot"]
-    missing_fields = forecast_result["missing_fields"]
-    X_ready = forecast_result["X_ready"]
-
-    prediction = pipeline.predict(X_ready)
-
-    if len(prediction) != 1:
-        raise ValueError(f"Expected exactly 1 prediction, got {len(prediction)}")
-
-    result: dict[str, Any] = {
-        "model_type": model_type,
-        "city_name": city_name,
-        "sunset_time_today": sunset_time_today,
-        "snapshot": snapshot,
-        "missing_fields_from_forecast": missing_fields,
-        "X_ready": X_ready,
-    }
-
-    if model_type == "classification":
-        predicted_class = int(prediction[0])
-        predicted_label = class_to_label(predicted_class)
-
-        result.update(
-            {
-                "predicted_class": predicted_class,
-                "predicted_label": predicted_label,
-                "outlook": label_class(predicted_label),
-            }
+        forecast_result = build_today_model_input(
+            city_name=city_name,
+            latitude=latitude,
+            longitude=longitude,
+            feature_columns=raw_feature_columns,
+            timezone=timezone,
+            target_date=target_date,
+            fail_on_missing=False,
         )
 
-        if hasattr(pipeline, "predict_proba"):
-            probabilities = pipeline.predict_proba(X_ready)[0]
-            result["class_probabilities"] = {
-                "bad": float(probabilities[0]),
-                "ok": float(probabilities[1]),
-                "great": float(probabilities[2]),
-            }
+        sunset_time_today = forecast_result["sunset_time_today"]
+        snapshot = forecast_result["snapshot"]
+        missing_fields = forecast_result["missing_fields"]
+        X_ready = forecast_result["X_ready"]
 
-    elif model_type == "regression":
-        score = float(prediction[0])
+        prediction = pipeline.predict(X_ready)
 
-        if score < 4:
-            predicted_class = 1
-        elif score < 7:
-            predicted_class = 2
+        if len(prediction) != 1:
+            raise PredictionError(f"Expected exactly 1 prediction, got {len(prediction)}")
+
+        result: dict[str, Any] = {
+            "model_type": model_type,
+            "city_name": city_name,
+            "sunset_time_today": sunset_time_today,
+            "snapshot": snapshot,
+            "missing_fields_from_forecast": missing_fields,
+            "X_ready": X_ready,
+        }
+
+        if model_type == "classification":
+            predicted_class = int(prediction[0])
+            predicted_label = class_to_label(predicted_class)
+
+            result.update(
+                {
+                    "predicted_class": predicted_class,
+                    "predicted_label": predicted_label,
+                    "outlook": label_class(predicted_label),
+                }
+            )
+
+            if hasattr(pipeline, "predict_proba"):
+                probabilities = pipeline.predict_proba(X_ready)[0]
+                result["class_probabilities"] = {
+                    "bad": float(probabilities[0]),
+                    "ok": float(probabilities[1]),
+                    "great": float(probabilities[2]),
+                }
+
+        elif model_type == "regression":
+            score = float(prediction[0])
+
+            if score < 4:
+                predicted_class = 1
+            elif score < 7:
+                predicted_class = 2
+            else:
+                predicted_class = 3
+
+            predicted_label = class_to_label(predicted_class)
+
+            result.update(
+                {
+                    "score": score,
+                    "predicted_class": predicted_class,
+                    "predicted_label": predicted_label,
+                    "outlook": label_class(predicted_label),
+                }
+            )
+
         else:
-            predicted_class = 3
+            raise PredictionError(f"Unsupported model_type: {model_type}")
 
-        predicted_label = class_to_label(predicted_class)
+        return result
 
-        result.update(
-            {
-                "score": score,
-                "predicted_class": predicted_class,
-                "predicted_label": predicted_label,
-                "outlook": label_class(predicted_label),
-            }
-        )
-
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
-
-    return result
+    except (DataUnavailableError, ModelInputError):
+        raise
+    except PredictionError:
+        raise
+    except Exception as exc:
+        raise PredictionError(f"Prediction pipeline failed: {exc}") from exc
 
 
 # ================== FORMATTING ===================
@@ -173,21 +191,35 @@ def format_prediction_summary(result: dict[str, Any]) -> str:
             f"great={probs['great']:.3f}"
         )
 
+    if result.get("missing_fields_from_forecast"):
+        lines.append(
+            "Missing forecast fields: "
+            + ", ".join(result["missing_fields_from_forecast"])
+        )
+
     return "\n".join(lines)
 
 
 # ================== MAIN ===================
 if __name__ == "__main__":
-    result = predict_today_sunset(
-        city_name="Tel Aviv",
-        latitude=32.0853,
-        longitude=34.7818,
-        timezone="auto",
-        target_date=None,
-    )
+    try:
+        result = predict_today_sunset(
+            city_name="Tel Aviv",
+            latitude=32.0853,
+            longitude=34.7818,
+            timezone="auto",
+            target_date=None,
+        )
 
-    print(format_prediction_summary(result))
-    print("\nMissing fields reported by forecast.py:")
-    print(result["missing_fields_from_forecast"])
-    print("\nPrepared model input:")
-    print(result["X_ready"].to_string(index=False))
+        print(format_prediction_summary(result))
+        print("\nMissing fields reported by forecast.py:")
+        print(result["missing_fields_from_forecast"])
+        print("\nPrepared model input:")
+        print(result["X_ready"].to_string(index=False))
+
+    except DataUnavailableError as exc:
+        print(f"[predict] data unavailable: {exc}")
+    except ModelInputError as exc:
+        print(f"[predict] model input error: {exc}")
+    except PredictionError as exc:
+        print(f"[predict] prediction error: {exc}")
