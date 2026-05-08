@@ -7,6 +7,7 @@ from dateutil import parser as dateparser
 from astral import Observer
 from astral.sun import elevation, azimuth
 
+
 EXCEL_PATH = "sunset_project_schema_with_flickr_cols.xlsx"
 SHEET_NAME = 0
 
