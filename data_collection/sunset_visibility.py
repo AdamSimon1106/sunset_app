@@ -16,7 +16,7 @@ ELEVATION_ENDPOINT       = "https://api.open-elevation.com/api/v1/lookup"
 OPEN_METEO_FORECAST_URL  = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE_URL   = "https://archive-api.open-meteo.com/v1/archive"
 MAX_RETRIES              = 5
-EYE_LEVEL_M              = 1.7
+EYE_LEVEL_M              = 50
 TERRAIN_SAMPLES          = 20
 WEATHER_POINTS           = 4
 
@@ -84,7 +84,7 @@ async def get_elevation_m(session: aiohttp.ClientSession, sem: asyncio.Semaphore
                 print(f"[elevation error] attempt={attempt} lat={location.latitude} lon={location.longitude} err={e}")
                 await asyncio.sleep(0.5 * attempt)
     print(f"[elevation failed] lat={location.latitude} lon={location.longitude}")
-    return None
+    return 200
 
 
 async def get_elevations_batch(session: aiohttp.ClientSession, sem: asyncio.Semaphore, points: list[Point]) -> list[Optional[float]]:
@@ -256,8 +256,8 @@ async def process_many(requests_list: list[dict]) -> list[dict]:
 
 async def main():
     requests_list = [
-        {"lat": 32.0853, "lon": 34.7818, "dt_utc": datetime(2026, 4, 19, 17, 0, 0)},   # past
-        {"lat": 32.0853, "lon": 34.7818, "dt_utc": datetime(2026, 5, 9, 17, 0, 0)},  # future
+        {"lat": 32.0853, "lon": 34.7818, "dt_utc": datetime(2026, 4, 15, 16, 30, 0)},   # past
+        {"lat": 40.630182059416654, "lon": 14.384823257952677, "dt_utc": datetime(2026, 5, 9, 17, 0, 0)},  # future
     ]
 
     results = await process_many(requests_list)
