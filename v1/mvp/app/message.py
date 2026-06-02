@@ -13,7 +13,7 @@ from v1.mvp.app.predict import (
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = "-1003771989105"
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 TELEGRAM_TIMEOUT_SECONDS = 30
 
 
