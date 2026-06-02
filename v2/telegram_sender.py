@@ -22,6 +22,15 @@ def send_telegram_text(message: str) -> dict:
         },
         timeout=TELEGRAM_TIMEOUT_SECONDS,
     )
+    
+    # ADD THIS TEMPORARY LOGGING BLOCK HERE:
+    if response.status_code == 400:
+        print("--- TELEGRAM DEBBUGGING INFO ---")
+        print(f"Status Code: {response.status_code}")
+        print(f"Telegram Server Response: {response.text}")
+        print(f"Length of message sent: {len(message)}")
+        print("--------------------------------")
+
     response.raise_for_status()
 
     data = response.json()
