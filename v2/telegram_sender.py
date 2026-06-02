@@ -4,7 +4,7 @@ import requests
 from susnset_forcast_generator import generate_forecast_text
 
 # ========== CONFIG ==========
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_ID")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEM")
 CHANNEL_ID = "-1003771989105"
 TELEGRAM_TIMEOUT_SECONDS = 30
 
