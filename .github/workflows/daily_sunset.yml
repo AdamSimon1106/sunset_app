@@ -25,8 +25,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run app
+        working-directory: ./v2
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        run: python -m v2.telegram_sender
+        run: python -m telegram_sender
