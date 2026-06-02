@@ -7,7 +7,6 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import (
@@ -23,10 +22,10 @@ from sklearn.ensemble import (
     HistGradientBoostingClassifier,
 )
 from sklearn.utils.class_weight import compute_sample_weight
-from mvp.app.model_preprocessing import WeatherPreprocessor
+from v1.mvp.app.model_preprocessing import WeatherPreprocessor
 
 # ================== CONFIG ===================
-PATH_TO_RAW_DATA = "../data/raw/raw_sunsets_ranked.xlsx"
+PATH_TO_RAW_DATA = "../../data/raw/raw_sunsets_ranked.xlsx"
 PATH_TO_FINAL_BUNDLE = "../mvp/models/sunset_best_pipeline.pkl"
 PATH_TO_REPORT_JSON = "../models/sunset_model_comparison_report.json"
 

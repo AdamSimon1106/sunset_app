@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 import requests
 
-from mvp.app.forecast_generator import generate_forecast_text
-from mvp.app.predict import (
+from v1.mvp.app.forecast_generator import generate_forecast_text
+from v1.mvp.app.predict import (
     DataUnavailableError,
     ModelInputError,
     PredictionError,

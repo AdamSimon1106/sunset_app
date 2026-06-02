@@ -1,4 +1,4 @@
-from mvp.app.message import send_message
+from v1.mvp.app.message import send_message
 
 def main():
     send_message()
