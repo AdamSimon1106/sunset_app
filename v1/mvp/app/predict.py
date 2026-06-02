@@ -6,7 +6,7 @@ from typing import Any
 
 import joblib
 
-from mvp.app.forecast import (
+from v1.mvp.app.forecast import (
     DataUnavailableError,
     ModelInputError,
     build_today_model_input,
