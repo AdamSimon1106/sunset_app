@@ -29,4 +29,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        run: python -m mvp.app.main
+        run: python -m v2.telegram_sender
