@@ -2,7 +2,7 @@ name: Daily Sunset Forecast
 
 on:
   schedule:
-    - cron: "0 9 * * *"
+    - cron: "23 8 * * *"
   workflow_dispatch:
 
 jobs:
