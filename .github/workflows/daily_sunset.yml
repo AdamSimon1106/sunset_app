@@ -23,8 +23,7 @@ jobs:
         with:
           timeout_minutes: 5
           max_attempts: 3
-          working-directory: ./v2
-          command: python -m telegram_sender
+          command: cd v2 && python -m telegram_sender
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
