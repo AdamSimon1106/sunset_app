@@ -325,36 +325,32 @@ async def fetch_weather_data(
         "timezone":   "UTC",
     }
 
-    # Primary: ECMWF for accurate cloud layers (forecast only, ~10-day horizon)
-    ecmwf_hourly = await _fetch_hourly(
+    # Primary: ICON, which exposes reliable layered cloud cover (low/mid/high),
+    # visibility, and all surface-weather fields in a single request.
+    # NOTE: ECMWF IFS025 on Open-Meteo returns 0 for the layered cloud fields
+    # (and often total too), so it must NOT be used for cloud layers here.
+    hourly = await _fetch_hourly(
         session, sem, fm.endpoint,
-        {**base_params, "models": "ecmwf_ifs025"},
-        target, label="ecmwf",
+        {**base_params, "models": "icon_seamless"},
+        target, label="icon",
     )
 
-    # Fallback to ICON if ECMWF unavailable (archive or beyond 10-day horizon)
-    icon_hourly: Optional[dict] = None
-    if ecmwf_hourly is None:
-        ecmwf_hourly = await _fetch_hourly(
+    # Fallback to best_match if ICON is unavailable for this hour/location.
+    if hourly is None:
+        hourly = await _fetch_hourly(
             session, sem, fm.endpoint,
-            base_params, target, label="icon_fallback",
+            base_params, target, label="best_match_fallback",
         )
-        if ecmwf_hourly is None:
+        if hourly is None:
             return None
-    elif include_full_weather:
-        # Fetch ICON separately only to get visibility, which ECMWF does not provide
-        icon_hourly = await _fetch_hourly(
-            session, sem, fm.endpoint,
-            base_params, target, label="icon_visibility",
-        )
 
     def get(hourly: dict, key: str) -> Optional[float]:
         return _extract_hour(hourly, key, target)
 
-    low   = get(ecmwf_hourly, fm.cloudcover_low)
-    mid   = get(ecmwf_hourly, fm.cloudcover_mid)
-    high  = get(ecmwf_hourly, fm.cloudcover_high)
-    total = get(ecmwf_hourly, fm.cloudcover_total)
+    low   = get(hourly, fm.cloudcover_low)
+    mid   = get(hourly, fm.cloudcover_mid)
+    high  = get(hourly, fm.cloudcover_high)
+    total = get(hourly, fm.cloudcover_total)
 
     # ECMWF quirk: total can be non-zero even when all three layers are 0 due to
     # internal maximum-overlap cloud fraction computation. Use effective_total
@@ -362,8 +358,8 @@ async def fetch_weather_data(
     layer_max       = max(low or 0.0, mid or 0.0, high or 0.0)
     effective_total = max(total or 0.0, layer_max)
 
-    precip = get(ecmwf_hourly, fm.precipitation) if include_full_weather else None
-    temp   = get(ecmwf_hourly, fm.temperature_2m) if include_full_weather else None
+    precip = get(hourly, fm.precipitation) if include_full_weather else None
+    temp   = get(hourly, fm.temperature_2m) if include_full_weather else None
 
     result: dict = {
         "clouds": {
@@ -376,21 +372,19 @@ async def fetch_weather_data(
     }
 
     if include_full_weather:
-        # Visibility from ICON (ECMWF does not expose it); everything else from ECMWF
-        visibility = get(icon_hourly, fm.visibility) if icon_hourly else None
         result["weather"] = {
             "temp_c":                  temp,
-            "apparent_temp_c":         get(ecmwf_hourly, fm.apparent_temperature),
-            "dewpoint_c":              get(ecmwf_hourly, fm.dewpoint_2m),
-            "humidity_pct":            get(ecmwf_hourly, fm.relative_humidity_2m),
-            "wind_speed_kmh":          get(ecmwf_hourly, fm.windspeed_10m),
-            "wind_dir_deg":            get(ecmwf_hourly, fm.winddirection_10m),
-            "wind_gusts_kmh":          get(ecmwf_hourly, fm.windgusts_10m),
+            "apparent_temp_c":         get(hourly, fm.apparent_temperature),
+            "dewpoint_c":              get(hourly, fm.dewpoint_2m),
+            "humidity_pct":            get(hourly, fm.relative_humidity_2m),
+            "wind_speed_kmh":          get(hourly, fm.windspeed_10m),
+            "wind_dir_deg":            get(hourly, fm.winddirection_10m),
+            "wind_gusts_kmh":          get(hourly, fm.windgusts_10m),
             "precip_mm":               precip,
-            "precip_prob_pct":         get(ecmwf_hourly, fm.precipitation_probability),
-            "pressure_hpa":            get(ecmwf_hourly, fm.surface_pressure),
-            "visibility_m":            visibility,
-            "shortwave_radiation_wm2": get(ecmwf_hourly, fm.shortwave_radiation),
+            "precip_prob_pct":         get(hourly, fm.precipitation_probability),
+            "pressure_hpa":            get(hourly, fm.surface_pressure),
+            "visibility_m":            get(hourly, fm.visibility),
+            "shortwave_radiation_wm2": get(hourly, fm.shortwave_radiation),
         }
 
     return result
