@@ -593,6 +593,20 @@ def get_today_sunset_utc(lat: float, lon: float, tz: str = "Asia/Jerusalem") -> 
     return s["sunset"].astimezone(timezone.utc).replace(tzinfo=None)
 
 
+# Minutes before sunset we recommend arriving.
+ARRIVAL_LEAD_MIN = 25
+
+
+def local_sunset_times(dt_utc: datetime, tz: str) -> tuple[str, str]:
+    """
+    Convert a naive-UTC sunset instant to the location's local wall-clock time,
+    DST-correct via ZoneInfo. Returns ("HH:MM" sunset, "HH:MM" recommended arrival).
+    """
+    local   = dt_utc.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(tz))
+    arrival = local - timedelta(minutes=ARRIVAL_LEAD_MIN)
+    return local.strftime("%H:%M"), arrival.strftime("%H:%M")
+
+
 # ======================== ENTRY POINT ========================
 
 async def main(requests_list: list[dict]) -> str:
@@ -602,21 +616,27 @@ async def main(requests_list: list[dict]) -> str:
     """
     resolved = []
     for r in requests_list:
-        dt_utc = r.get("dt_utc") or get_today_sunset_utc(r["lat"], r["lon"], tz=r.get("tz", "UTC"))
+        tz     = r.get("tz", "UTC")
+        dt_utc = r.get("dt_utc") or get_today_sunset_utc(r["lat"], r["lon"], tz=tz)
         print(f"Sunset UTC for ({r['lat']}, {r['lon']}): {dt_utc}")
-        resolved.append({"lat": r["lat"], "lon": r["lon"], "dt_utc": dt_utc})
+        resolved.append({"lat": r["lat"], "lon": r["lon"], "dt_utc": dt_utc, "tz": tz})
 
     results = await process_many(resolved)
 
     lines = []
 
-    for result in results:
+    for result, r in zip(results, resolved):
         if "error" in result:
             lines.append(f"Error: {result['error']}")
             continue
 
+        # Authoritative local sunset/arrival times, computed here (DST-correct) so the
+        # model never has to convert UTC itself.
+        sunset_local, arrival_local = local_sunset_times(r["dt_utc"], r["tz"])
+
         lines.append(f"\n{'=' * 60}")
         lines.append(f"Viewer: {result['viewer']}  |  {result['date']}  [{result['source']}]")
+        lines.append(f"Sunset (local): {sunset_local}  |  Recommended arrival: {arrival_local}")
         lines.append(
             f"Azimuth: {result['azimuth_deg']:.1f}°  |  Horizon: {result['visible_horizon_dist_m']:.0f}m  |  Blocking: {result['blocking_angle_deg']:.2f}°")
 
