@@ -24,6 +24,20 @@ EYE_LEVEL_M              = 50
 TERRAIN_SAMPLES          = 20
 WEATHER_POINTS           = 4
 
+# Cloud cover is taken as a consensus across several independent global models rather
+# than a single one: any single model is biased here (e.g. ICON over-forecasts a phantom
+# marine stratocumulus deck on the eastern-Med coast, while ECMWF under-calls it). Polling
+# all of them in one request and taking the median outvotes a lone outlier. Surface weather
+# is read from the first available of these (in order).
+CLOUD_MODELS = [
+    "ecmwf_ifs025",
+    "icon_seamless",
+    "gfs_seamless",
+    "gem_seamless",
+    "meteofrance_seamless",
+    "ukmo_seamless",
+]
+
 ELEVATION_CONCURRENCY    = 10
 WEATHER_CONCURRENCY      = 20
 TLV_LAT, TLV_LON = 32.0885752, 34.7704678
@@ -136,6 +150,27 @@ def _extract_hour(hourly: dict, key: str, target: str) -> Optional[float]:
     idx = times.index(target)
     v = values[idx]
     return float(v) if v is not None else None
+
+
+def _median(nums: list[float]) -> float:
+    """Median of a non-empty list (averages the middle pair for even counts)."""
+    s = sorted(nums)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _consensus(values: list[Optional[float]]) -> tuple[Optional[float], Optional[float], int]:
+    """
+    Combine per-model values for one cloud layer into a robust consensus.
+    Drops None (model not available for this point/hour), returns
+    (median, spread=max-min, n_models). Median rejects a lone outlier — e.g.
+    [55, 0, 0, 0, 2, 9] -> median 1.0, where a mean would be 11.0.
+    """
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return None, None, 0
+    return _median(nums), max(nums) - min(nums), len(nums)
 
 
 # ======================== CLOUD TYPE INFERENCE ========================
@@ -325,41 +360,64 @@ async def fetch_weather_data(
         "timezone":   "UTC",
     }
 
-    # Primary: ICON, which exposes reliable layered cloud cover (low/mid/high),
-    # visibility, and all surface-weather fields in a single request.
-    # NOTE: ECMWF IFS025 on Open-Meteo returns 0 for the layered cloud fields
-    # (and often total too), so it must NOT be used for cloud layers here.
-    hourly = await _fetch_hourly(
+    # Primary: poll all CLOUD_MODELS in one request. Open-Meteo suffixes each field with
+    # the model name, e.g. "cloud_cover_low_ecmwf_ifs025".
+    hourly   = await _fetch_hourly(
         session, sem, fm.endpoint,
-        {**base_params, "models": "icon_seamless"},
-        target, label="icon",
+        {**base_params, "models": ",".join(CLOUD_MODELS)},
+        target, label="multi_model",
     )
+    models   = list(CLOUD_MODELS)
+    suffixed = True
 
-    # Fallback to best_match if ICON is unavailable for this hour/location.
-    if hourly is None:
-        hourly = await _fetch_hourly(
-            session, sem, fm.endpoint,
-            base_params, target, label="best_match_fallback",
+    def field(base: str, model: str) -> str:
+        return f"{base}_{model}" if suffixed else base
+
+    def has_cloud(h: Optional[dict]) -> bool:
+        return h is not None and any(
+            _extract_hour(h, field(fm.cloudcover_low, m), target) is not None for m in models
         )
+
+    # Last-resort fallback: a single best_match request (unsuffixed fields) if the
+    # multi-model call failed or returned nothing usable for this point/hour.
+    if not has_cloud(hourly):
+        hourly         = await _fetch_hourly(
+            session, sem, fm.endpoint, base_params, target, label="best_match_fallback",
+        )
+        models, suffixed = ["best_match"], False
         if hourly is None:
             return None
 
-    def get(hourly: dict, key: str) -> Optional[float]:
+    def get(key: str) -> Optional[float]:
         return _extract_hour(hourly, key, target)
 
-    low   = get(hourly, fm.cloudcover_low)
-    mid   = get(hourly, fm.cloudcover_mid)
-    high  = get(hourly, fm.cloudcover_high)
-    total = get(hourly, fm.cloudcover_total)
+    def get_first(base: str) -> Optional[float]:
+        """First available model's value for a field (for non-cloud surface fields)."""
+        for m in models:
+            v = get(field(base, m))
+            if v is not None:
+                return v
+        return None
 
-    # ECMWF quirk: total can be non-zero even when all three layers are 0 due to
-    # internal maximum-overlap cloud fraction computation. Use effective_total
-    # as max(reported_total, max_layer) so cloud type inference stays consistent.
+    def layer(base: str) -> tuple[Optional[float], Optional[float], int]:
+        return _consensus([get(field(base, m)) for m in models])
+
+    low,   low_spread,   _      = layer(fm.cloudcover_low)
+    mid,   mid_spread,   _      = layer(fm.cloudcover_mid)
+    high,  high_spread,  _      = layer(fm.cloudcover_high)
+    total, _,            n_total = layer(fm.cloudcover_total)
+
+    n_models = n_total
+    spreads  = [s for s in (low_spread, mid_spread, high_spread) if s is not None]
+    spread   = max(spreads) if spreads else None
+
+    # total can be non-zero even when all three layers are 0 (max-overlap cloud fraction).
+    # Use effective_total = max(reported_total, max_layer) so cloud type inference is consistent.
     layer_max       = max(low or 0.0, mid or 0.0, high or 0.0)
     effective_total = max(total or 0.0, layer_max)
 
-    precip = get(hourly, fm.precipitation) if include_full_weather else None
-    temp   = get(hourly, fm.temperature_2m) if include_full_weather else None
+    precip = get_first(fm.precipitation)   if include_full_weather else None
+    temp   = get_first(fm.temperature_2m)  if include_full_weather else None
 
     result: dict = {
         "clouds": {
@@ -367,6 +425,8 @@ async def fetch_weather_data(
             "mid_pct":   mid,
             "high_pct":  high,
             "total_pct": total,
+            "n_models":  n_models,
+            "spread_pct": spread,
             "types":     infer_cloud_types(low, mid, high, effective_total, precip, temp),
         }
     }
@@ -374,17 +434,17 @@ async def fetch_weather_data(
     if include_full_weather:
         result["weather"] = {
             "temp_c":                  temp,
-            "apparent_temp_c":         get(hourly, fm.apparent_temperature),
-            "dewpoint_c":              get(hourly, fm.dewpoint_2m),
-            "humidity_pct":            get(hourly, fm.relative_humidity_2m),
-            "wind_speed_kmh":          get(hourly, fm.windspeed_10m),
-            "wind_dir_deg":            get(hourly, fm.winddirection_10m),
-            "wind_gusts_kmh":          get(hourly, fm.windgusts_10m),
+            "apparent_temp_c":         get_first(fm.apparent_temperature),
+            "dewpoint_c":              get_first(fm.dewpoint_2m),
+            "humidity_pct":            get_first(fm.relative_humidity_2m),
+            "wind_speed_kmh":          get_first(fm.windspeed_10m),
+            "wind_dir_deg":            get_first(fm.winddirection_10m),
+            "wind_gusts_kmh":          get_first(fm.windgusts_10m),
             "precip_mm":               precip,
-            "precip_prob_pct":         get(hourly, fm.precipitation_probability),
-            "pressure_hpa":            get(hourly, fm.surface_pressure),
-            "visibility_m":            get(hourly, fm.visibility),
-            "shortwave_radiation_wm2": get(hourly, fm.shortwave_radiation),
+            "precip_prob_pct":         get_first(fm.precipitation_probability),
+            "pressure_hpa":            get_first(fm.surface_pressure),
+            "visibility_m":            get_first(fm.visibility),
+            "shortwave_radiation_wm2": get_first(fm.shortwave_radiation),
         }
 
     return result
@@ -575,10 +635,13 @@ async def main(requests_list: list[dict]) -> str:
 
         c = result.get("viewer_clouds")
         if c:
-            lines.append(f"\n── Clouds at Viewer ──")
-            lines.append(f"  Low (<2 km):       {c['low_pct']}%")
-            lines.append(f"  Mid (2–7 km):      {c['mid_pct']}%")
-            lines.append(f"  High (>7 km):      {c['high_pct']}%")
+            spread = c.get("spread_pct")
+            agree  = (f"{c.get('n_models', 0)} models, spread {spread:.0f}%"
+                      if spread is not None else f"{c.get('n_models', 0)} models")
+            lines.append(f"\n── Clouds at Viewer (consensus of {agree}) ──")
+            lines.append(f"  Low (<3 km):       {c['low_pct']}%")
+            lines.append(f"  Mid (3–8 km):      {c['mid_pct']}%")
+            lines.append(f"  High (>8 km):      {c['high_pct']}%")
             lines.append(f"  Total cover:       {c['total_pct']}%")
             lines.append(f"  Cloud types:       {', '.join(c['types'])}")
 
@@ -605,10 +668,12 @@ async def main(requests_list: list[dict]) -> str:
                 lines.append(f"  [{pt['point_index']}] {pt['distance_m']:6d}m  ->  fetch failed")
             else:
                 types_str = ", ".join(c["types"])
+                spread    = c.get("spread_pct")
+                agree     = f"  [{c.get('n_models', 0)}m, ±{spread:.0f}]" if spread is not None else ""
                 lines.append(
                     f"  [{pt['point_index']}] {pt['distance_m']:6d}m  ->  "
                     f"low={c['low_pct']}%  mid={c['mid_pct']}%  high={c['high_pct']}%  "
-                    f"total={c['total_pct']}%  |  {types_str}"
+                    f"total={c['total_pct']}%  |  {types_str}{agree}"
                 )
 
     forecast_str = "\n".join(lines)
