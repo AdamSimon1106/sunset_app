@@ -38,6 +38,13 @@ CLOUD_MODELS = [
     "ukmo_seamless",
 ]
 
+# All six models above are fetched and compared every run (the comparison is printed
+# to the logs), but the written forecast that gets sent to Telegram is driven by ICON
+# alone: it calls the eastern-Med coastal low-cloud deck better than the median does
+# (see model_accuracy.py). The median is only a fallback when ICON has no value for a
+# given point/hour.
+FORECAST_MODEL = "icon_seamless"
+
 ELEVATION_CONCURRENCY    = 10
 WEATHER_CONCURRENCY      = 20
 TLV_LAT, TLV_LON = 32.0885752, 34.7704678
@@ -399,17 +406,33 @@ async def fetch_weather_data(
                 return v
         return None
 
-    def layer(base: str) -> tuple[Optional[float], Optional[float], int]:
-        return _consensus([get(field(base, m)) for m in models])
+    def per_model_layer(base: str) -> dict[str, Optional[float]]:
+        """Raw per-model values for one cloud layer (None where a model is absent)."""
+        return {m: get(field(base, m)) for m in models}
 
-    low,   low_spread,   _      = layer(fm.cloudcover_low)
-    mid,   mid_spread,   _      = layer(fm.cloudcover_mid)
-    high,  high_spread,  _      = layer(fm.cloudcover_high)
-    total, _,            n_total = layer(fm.cloudcover_total)
+    # Pull every model's value for each layer once. ICON drives the written forecast;
+    # the median + spread of all models is kept alongside for the comparison logs.
+    per_low   = per_model_layer(fm.cloudcover_low)
+    per_mid   = per_model_layer(fm.cloudcover_mid)
+    per_high  = per_model_layer(fm.cloudcover_high)
+    per_total = per_model_layer(fm.cloudcover_total)
 
-    n_models = n_total
-    spreads  = [s for s in (low_spread, mid_spread, high_spread) if s is not None]
-    spread   = max(spreads) if spreads else None
+    def pick(per: dict[str, Optional[float]]) -> tuple[Optional[float], Optional[float], Optional[float], int]:
+        """Return (forecast_value, median, spread, n_models) for one layer.
+        forecast_value is ICON's own number when present, else the median (fallback)."""
+        median, spread, n = _consensus(list(per.values()))
+        icon = per.get(FORECAST_MODEL)
+        return (icon if icon is not None else median), median, spread, n
+
+    low,   low_med,   low_spread,   _       = pick(per_low)
+    mid,   mid_med,   mid_spread,   _       = pick(per_mid)
+    high,  high_med,  high_spread,  _       = pick(per_high)
+    total, total_med, _,            n_total = pick(per_total)
+
+    n_models     = n_total
+    spreads      = [s for s in (low_spread, mid_spread, high_spread) if s is not None]
+    spread       = max(spreads) if spreads else None
+    cloud_source = FORECAST_MODEL if per_low.get(FORECAST_MODEL) is not None else "median"
 
     # total can be non-zero even when all three layers are 0 (max-overlap cloud fraction).
     # Use effective_total = max(reported_total, max_layer) so cloud type inference is consistent.
@@ -421,13 +444,21 @@ async def fetch_weather_data(
 
     result: dict = {
         "clouds": {
-            "low_pct":   low,
-            "mid_pct":   mid,
-            "high_pct":  high,
-            "total_pct": total,
-            "n_models":  n_models,
+            # ICON-driven values used for the written forecast (median fallback).
+            "low_pct":    low,
+            "mid_pct":    mid,
+            "high_pct":   high,
+            "total_pct":  total,
+            "source":     cloud_source,
+            "types":      infer_cloud_types(low, mid, high, effective_total, precip, temp),
+            # 6-model comparison context (logs only — not part of the Telegram text).
+            "n_models":   n_models,
             "spread_pct": spread,
-            "types":     infer_cloud_types(low, mid, high, effective_total, precip, temp),
+            "median":     {"low": low_med, "mid": mid_med, "high": high_med, "total": total_med},
+            "per_model":  {
+                m: {"low": per_low[m], "mid": per_mid[m], "high": per_high[m], "total": per_total[m]}
+                for m in models
+            },
         }
     }
 
@@ -607,6 +638,34 @@ def local_sunset_times(dt_utc: datetime, tz: str) -> tuple[str, str]:
     return local.strftime("%H:%M"), arrival.strftime("%H:%M")
 
 
+def _format_model_comparison(result: dict) -> list[str]:
+    """Side-by-side 6-model cloud table for each azimuth point.
+
+    Printed to the logs only so we keep comparing all six models every run — it is
+    deliberately not part of the forecast text, which is ICON-only.
+    """
+    cols = ("low", "mid", "high", "total")
+
+    def cell(v: Optional[float]) -> str:
+        return f"{v:7.0f}" if v is not None else f"{'·':>7}"
+
+    lines = ["\n── 6-Model Cloud Comparison (logs only; forecast text uses ICON) ──"]
+    for pt in result.get("points", []):
+        c = pt.get("clouds")
+        header = f"  point[{pt['point_index']}] {pt['distance_m']}m"
+        if not c or not c.get("per_model"):
+            lines.append(f"{header}: no data")
+            continue
+        lines.append(header)
+        lines.append("    " + f"{'model':<22}" + "".join(f"{col:>7}" for col in cols))
+        for m, vals in c["per_model"].items():
+            tag = "  ← used (ICON)" if m == c.get("source") else ""
+            lines.append("    " + f"{m:<22}" + "".join(cell(vals.get(col)) for col in cols) + tag)
+        med = c.get("median", {})
+        lines.append("    " + f"{'median':<22}" + "".join(cell(med.get(col)) for col in cols))
+    return lines
+
+
 # ======================== ENTRY POINT ========================
 
 async def main(requests_list: list[dict]) -> str:
@@ -655,10 +714,7 @@ async def main(requests_list: list[dict]) -> str:
 
         c = result.get("viewer_clouds")
         if c:
-            spread = c.get("spread_pct")
-            agree  = (f"{c.get('n_models', 0)} models, spread {spread:.0f}%"
-                      if spread is not None else f"{c.get('n_models', 0)} models")
-            lines.append(f"\n── Clouds at Viewer (consensus of {agree}) ──")
+            lines.append(f"\n── Clouds at Viewer ({c.get('source', FORECAST_MODEL)}) ──")
             lines.append(f"  Low (<3 km):       {c['low_pct']}%")
             lines.append(f"  Mid (3–8 km):      {c['mid_pct']}%")
             lines.append(f"  High (>8 km):      {c['high_pct']}%")
@@ -681,23 +737,28 @@ async def main(requests_list: list[dict]) -> str:
         else:
             lines.append(f"\n  [air quality: not available for past dates]")
 
-        lines.append(f"\n── Cloud Cover Along Sunset Azimuth ──")
+        src = (result.get("viewer_clouds") or {}).get("source", FORECAST_MODEL)
+        lines.append(f"\n── Cloud Cover Along Sunset Azimuth ({src}) ──")
         for pt in result["points"]:
             c = pt["clouds"]
             if c is None:
                 lines.append(f"  [{pt['point_index']}] {pt['distance_m']:6d}m  ->  fetch failed")
             else:
                 types_str = ", ".join(c["types"])
-                spread    = c.get("spread_pct")
-                agree     = f"  [{c.get('n_models', 0)}m, ±{spread:.0f}]" if spread is not None else ""
                 lines.append(
                     f"  [{pt['point_index']}] {pt['distance_m']:6d}m  ->  "
                     f"low={c['low_pct']}%  mid={c['mid_pct']}%  high={c['high_pct']}%  "
-                    f"total={c['total_pct']}%  |  {types_str}{agree}"
+                    f"total={c['total_pct']}%  |  {types_str}"
                 )
 
+    # The forecast text sent to Telegram is ICON-only (built above). The full 6-model
+    # comparison is printed to the logs here, but deliberately NOT folded into
+    # forecast_str so the written forecast stays based solely on ICON.
     forecast_str = "\n".join(lines)
     print(forecast_str)
+    for result in results:
+        if "error" not in result:
+            print("\n".join(_format_model_comparison(result)))
     return forecast_str
 
 
