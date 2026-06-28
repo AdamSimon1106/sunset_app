@@ -19,16 +19,23 @@ ELEVATION_ENDPOINT       = "https://api.open-elevation.com/api/v1/lookup"
 OPEN_METEO_FORECAST_URL  = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE_URL   = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+# DWD (Deutscher Wetterdienst) is the production model, served as JSON by Bright Sky.
+BRIGHTSKY_URL            = "https://api.brightsky.dev/weather"
 MAX_RETRIES              = 5
 EYE_LEVEL_M              = 50
 TERRAIN_SAMPLES          = 20
 WEATHER_POINTS           = 4
 
-# Cloud cover is taken as a consensus across several independent global models rather
-# than a single one: any single model is biased here (e.g. ICON over-forecasts a phantom
-# marine stratocumulus deck on the eastern-Med coast, while ECMWF under-calls it). Polling
-# all of them in one request and taking the median outvotes a lone outlier. Surface weather
-# is read from the first available of these (in order).
+# PRODUCTION model: DWD's MOSMIX statistical point forecast, served as JSON by Bright Sky
+# (https://brightsky.dev). The written forecast sent to Telegram is now driven by DWD.
+# MOSMIX returns a single *total* cloud-cover figure for the nearest station — there is
+# no low/mid/high vertical split — so cloud typing and scoring run off total cover alone.
+PRODUCTION_SOURCE = "dwd_mosmix"
+
+# These six gridded global models are still polled every run and printed in the comparison
+# logs (so we keep watching how DWD's total stacks up against the gridded consensus), but
+# they no longer drive the written forecast. The median across them is the fallback for the
+# production total when MOSMIX has no value for a given point/hour.
 CLOUD_MODELS = [
     "ecmwf_ifs025",
     "icon_seamless",
@@ -38,11 +45,7 @@ CLOUD_MODELS = [
     "ukmo_seamless",
 ]
 
-# All six models above are fetched and compared every run (the comparison is printed
-# to the logs), but the written forecast that gets sent to Telegram is driven by ICON
-# alone: it calls the eastern-Med coastal low-cloud deck better than the median does
-# (see model_accuracy.py). The median is only a fallback when ICON has no value for a
-# given point/hour.
+# ICON is kept only as a label/reference in the comparison logs; it no longer drives output.
 FORECAST_MODEL = "icon_seamless"
 
 ELEVATION_CONCURRENCY    = 10
@@ -159,6 +162,11 @@ def _extract_hour(hourly: dict, key: str, target: str) -> Optional[float]:
     return float(v) if v is not None else None
 
 
+def _f(v) -> Optional[float]:
+    """Coerce an API value to float, preserving None."""
+    return float(v) if v is not None else None
+
+
 def _median(nums: list[float]) -> float:
     """Median of a non-empty list (averages the middle pair for even counts)."""
     s = sorted(nums)
@@ -225,6 +233,28 @@ def infer_cloud_types(
         types = ["Clear sky"]
 
     return types
+
+
+def describe_total_cloud(total_pct: Optional[float], precipitation: Optional[float]) -> list[str]:
+    """Coverage description from total cloud cover alone.
+
+    DWD MOSMIX reports only a single total cloud fraction (no low/mid/high split), so
+    unlike infer_cloud_types() we cannot name cloud genera (Cirrus, Stratocumulus, …) —
+    we can only describe how much of the sky is covered.
+    """
+    total  = total_pct or 0.0
+    precip = precipitation or 0.0
+    if total < 10:
+        return ["Clear sky"]
+    if precip > 0.5:
+        return ["Overcast (precipitation)"]
+    if total < 30:
+        return ["Few clouds"]
+    if total < 60:
+        return ["Scattered clouds"]
+    if total < 85:
+        return ["Broken clouds"]
+    return ["Overcast"]
 
 
 # ======================== GEOMETRY ========================
@@ -347,6 +377,72 @@ async def _fetch_hourly(
     return None
 
 
+async def fetch_brightsky(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    location: Point,
+    dt_utc: datetime,
+) -> Optional[dict]:
+    """DWD MOSMIX (Bright Sky) for one point/hour — the production cloud+weather source.
+
+    Returns total cloud cover plus surface weather for the MOSMIX station nearest to the
+    requested point. MOSMIX has no vertical cloud split, so only `total_pct` is available.
+    Bright Sky snaps to the nearest station, so points close together may resolve to the
+    same station — the resolved station (name/distance) is returned for the logs.
+    """
+    target = dt_utc.strftime("%Y-%m-%dT%H:00")
+    params = {
+        "lat":       location.latitude,
+        "lon":       location.longitude,
+        # date-only last_date is read as that day's 00:00, so widen to the next day and
+        # filter to the target hour ourselves — otherwise only the midnight record returns.
+        "date":      dt_utc.strftime("%Y-%m-%d"),
+        "last_date": (dt_utc + timedelta(days=1)).strftime("%Y-%m-%d"),
+        "tz":        "UTC",
+        "units":     "dwd",   # °C, km/h, mm, hPa, m — matches the Open-Meteo units used elsewhere
+    }
+    async with sem:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with session.get(BRIGHTSKY_URL, params=params) as r:
+                    r.raise_for_status()
+                    data    = await r.json()
+                    records = data.get("weather") or []
+                    rec     = next((w for w in records if (w.get("timestamp") or "")[:16] == target), None)
+                    if rec is None:
+                        print(f"[brightsky] hour {target} not in response.")
+                        return None
+                    sources = data.get("sources") or []
+                    src     = next((s for s in sources if s.get("id") == rec.get("source_id")),
+                                   sources[0] if sources else {})
+                    return {
+                        "total_pct": _f(rec.get("cloud_cover")),
+                        "weather": {
+                            "temp_c":          _f(rec.get("temperature")),
+                            "dewpoint_c":      _f(rec.get("dew_point")),
+                            "humidity_pct":    _f(rec.get("relative_humidity")),
+                            "wind_speed_kmh":  _f(rec.get("wind_speed")),
+                            "wind_dir_deg":    _f(rec.get("wind_direction")),
+                            "wind_gusts_kmh":  _f(rec.get("wind_gust_speed")),
+                            "precip_mm":       _f(rec.get("precipitation")),
+                            "precip_prob_pct": _f(rec.get("precipitation_probability")),
+                            "pressure_hpa":    _f(rec.get("pressure_msl")),
+                            "visibility_m":    _f(rec.get("visibility")),
+                            "condition":       rec.get("condition"),
+                        },
+                        "station": {
+                            "name":       src.get("station_name"),
+                            "wmo_id":     src.get("wmo_station_id"),
+                            "distance_m": src.get("distance"),
+                        },
+                    }
+            except Exception as e:
+                print(f"[brightsky error] attempt={attempt} lat={location.latitude} lon={location.longitude} err={e}")
+                await asyncio.sleep(0.5 * attempt)
+    print(f"[brightsky failed] lat={location.latitude} lon={location.longitude}")
+    return None
+
+
 async def fetch_weather_data(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
@@ -388,15 +484,13 @@ async def fetch_weather_data(
     # Last-resort fallback: a single best_match request (unsuffixed fields) if the
     # multi-model call failed or returned nothing usable for this point/hour.
     if not has_cloud(hourly):
-        hourly         = await _fetch_hourly(
+        hourly           = await _fetch_hourly(
             session, sem, fm.endpoint, base_params, target, label="best_match_fallback",
         )
         models, suffixed = ["best_match"], False
-        if hourly is None:
-            return None
 
     def get(key: str) -> Optional[float]:
-        return _extract_hour(hourly, key, target)
+        return _extract_hour(hourly, key, target) if hourly else None
 
     def get_first(base: str) -> Optional[float]:
         """First available model's value for a field (for non-cloud surface fields)."""
@@ -410,72 +504,88 @@ async def fetch_weather_data(
         """Raw per-model values for one cloud layer (None where a model is absent)."""
         return {m: get(field(base, m)) for m in models}
 
-    # Pull every model's value for each layer once. ICON drives the written forecast;
-    # the median + spread of all models is kept alongside for the comparison logs.
+    # Gridded-model layers — comparison context only (logs), no longer drive the forecast.
     per_low   = per_model_layer(fm.cloudcover_low)
     per_mid   = per_model_layer(fm.cloudcover_mid)
     per_high  = per_model_layer(fm.cloudcover_high)
     per_total = per_model_layer(fm.cloudcover_total)
 
-    def pick(per: dict[str, Optional[float]]) -> tuple[Optional[float], Optional[float], Optional[float], int]:
-        """Return (forecast_value, median, spread, n_models) for one layer.
-        forecast_value is ICON's own number when present, else the median (fallback)."""
-        median, spread, n = _consensus(list(per.values()))
-        icon = per.get(FORECAST_MODEL)
-        return (icon if icon is not None else median), median, spread, n
-
-    low,   low_med,   low_spread,   _       = pick(per_low)
-    mid,   mid_med,   mid_spread,   _       = pick(per_mid)
-    high,  high_med,  high_spread,  _       = pick(per_high)
-    total, total_med, _,            n_total = pick(per_total)
-
-    n_models     = n_total
+    low_med,   low_spread,   _       = _consensus(list(per_low.values()))
+    mid_med,   mid_spread,   _       = _consensus(list(per_mid.values()))
+    high_med,  high_spread,  _       = _consensus(list(per_high.values()))
+    total_med, _,            n_total = _consensus(list(per_total.values()))
     spreads      = [s for s in (low_spread, mid_spread, high_spread) if s is not None]
     spread       = max(spreads) if spreads else None
-    cloud_source = FORECAST_MODEL if per_low.get(FORECAST_MODEL) is not None else "median"
 
-    # total can be non-zero even when all three layers are 0 (max-overlap cloud fraction).
-    # Use effective_total = max(reported_total, max_layer) so cloud type inference is consistent.
-    layer_max       = max(low or 0.0, mid or 0.0, high or 0.0)
-    effective_total = max(total or 0.0, layer_max)
+    # ---- Production source: DWD MOSMIX (Bright Sky) ----
+    mosmix       = await fetch_brightsky(session, sem, location, dt_utc)
+    mosmix_total = mosmix["total_pct"] if mosmix else None
 
-    precip = get_first(fm.precipitation)   if include_full_weather else None
-    temp   = get_first(fm.temperature_2m)  if include_full_weather else None
+    if mosmix is None and not has_cloud(hourly):
+        return None  # neither DWD nor the gridded fallback returned anything usable
+
+    # Production total cloud cover: DWD MOSMIX when available, else the gridded median.
+    total        = mosmix_total if mosmix_total is not None else total_med
+    cloud_source = PRODUCTION_SOURCE if mosmix_total is not None else "median"
+
+    # Precip drives the coverage descriptor; MOSMIX reports it at every point.
+    precip = mosmix["weather"]["precip_mm"] if mosmix else (
+        get_first(fm.precipitation) if include_full_weather else None
+    )
+
+    # MOSMIX has no vertical split — low/mid/high are unavailable for the production forecast.
+    types = describe_total_cloud(total, precip)
+
+    # Fold DWD into the per-model comparison table (total only; no layers).
+    per_low[PRODUCTION_SOURCE]   = None
+    per_mid[PRODUCTION_SOURCE]   = None
+    per_high[PRODUCTION_SOURCE]  = None
+    per_total[PRODUCTION_SOURCE] = mosmix_total
+    log_models = models + [PRODUCTION_SOURCE]
 
     result: dict = {
         "clouds": {
-            # ICON-driven values used for the written forecast (median fallback).
-            "low_pct":    low,
-            "mid_pct":    mid,
-            "high_pct":   high,
+            # DWD-driven production values for the written forecast (median total fallback).
+            "low_pct":    None,
+            "mid_pct":    None,
+            "high_pct":   None,
             "total_pct":  total,
             "source":     cloud_source,
-            "types":      infer_cloud_types(low, mid, high, effective_total, precip, temp),
-            # 6-model comparison context (logs only — not part of the Telegram text).
-            "n_models":   n_models,
+            "types":      types,
+            "station":    (mosmix or {}).get("station"),
+            # Multi-model comparison context (logs only — not part of the Telegram text).
+            "n_models":   n_total,
             "spread_pct": spread,
             "median":     {"low": low_med, "mid": mid_med, "high": high_med, "total": total_med},
             "per_model":  {
                 m: {"low": per_low[m], "mid": per_mid[m], "high": per_high[m], "total": per_total[m]}
-                for m in models
+                for m in log_models
             },
         }
     }
 
     if include_full_weather:
+        mw = (mosmix or {}).get("weather", {})
+
+        def prefer(key: str, om_base: str) -> Optional[float]:
+            """DWD value when present, else fall back to the gridded model (Open-Meteo)."""
+            v = mw.get(key)
+            return v if v is not None else get_first(om_base)
+
         result["weather"] = {
-            "temp_c":                  temp,
-            "apparent_temp_c":         get_first(fm.apparent_temperature),
-            "dewpoint_c":              get_first(fm.dewpoint_2m),
-            "humidity_pct":            get_first(fm.relative_humidity_2m),
-            "wind_speed_kmh":          get_first(fm.windspeed_10m),
-            "wind_dir_deg":            get_first(fm.winddirection_10m),
-            "wind_gusts_kmh":          get_first(fm.windgusts_10m),
-            "precip_mm":               precip,
-            "precip_prob_pct":         get_first(fm.precipitation_probability),
-            "pressure_hpa":            get_first(fm.surface_pressure),
-            "visibility_m":            get_first(fm.visibility),
-            "shortwave_radiation_wm2": get_first(fm.shortwave_radiation),
+            "temp_c":                  prefer("temp_c", fm.temperature_2m),
+            "apparent_temp_c":         get_first(fm.apparent_temperature),   # MOSMIX has none
+            "dewpoint_c":              prefer("dewpoint_c", fm.dewpoint_2m),
+            "humidity_pct":            prefer("humidity_pct", fm.relative_humidity_2m),
+            "wind_speed_kmh":          prefer("wind_speed_kmh", fm.windspeed_10m),
+            "wind_dir_deg":            prefer("wind_dir_deg", fm.winddirection_10m),
+            "wind_gusts_kmh":          prefer("wind_gusts_kmh", fm.windgusts_10m),
+            "precip_mm":               prefer("precip_mm", fm.precipitation),
+            "precip_prob_pct":         prefer("precip_prob_pct", fm.precipitation_probability),
+            "pressure_hpa":            prefer("pressure_hpa", fm.surface_pressure),
+            "visibility_m":            prefer("visibility_m", fm.visibility),
+            "shortwave_radiation_wm2": get_first(fm.shortwave_radiation),    # MOSMIX has none
+            "source":                  PRODUCTION_SOURCE if mosmix else "open_meteo",
         }
 
     return result
@@ -639,17 +749,18 @@ def local_sunset_times(dt_utc: datetime, tz: str) -> tuple[str, str]:
 
 
 def _format_model_comparison(result: dict) -> list[str]:
-    """Side-by-side 6-model cloud table for each azimuth point.
+    """Side-by-side cloud table for each azimuth point.
 
-    Printed to the logs only so we keep comparing all six models every run — it is
-    deliberately not part of the forecast text, which is ICON-only.
+    Printed to the logs only so we keep comparing the gridded models (and now DWD's total)
+    every run — it is deliberately not part of the forecast text, which is DWD-only. DWD
+    MOSMIX has no vertical split, so its low/mid/high cells show "·".
     """
     cols = ("low", "mid", "high", "total")
 
     def cell(v: Optional[float]) -> str:
         return f"{v:7.0f}" if v is not None else f"{'·':>7}"
 
-    lines = ["\n── 6-Model Cloud Comparison (logs only; forecast text uses ICON) ──"]
+    lines = ["\n── Cloud Model Comparison (logs only; forecast text uses DWD MOSMIX) ──"]
     for pt in result.get("points", []):
         c = pt.get("clouds")
         header = f"  point[{pt['point_index']}] {pt['distance_m']}m"
@@ -659,7 +770,7 @@ def _format_model_comparison(result: dict) -> list[str]:
         lines.append(header)
         lines.append("    " + f"{'model':<22}" + "".join(f"{col:>7}" for col in cols))
         for m, vals in c["per_model"].items():
-            tag = "  ← used (ICON)" if m == c.get("source") else ""
+            tag = "  ← production (DWD)" if m == c.get("source") else ""
             lines.append("    " + f"{m:<22}" + "".join(cell(vals.get(col)) for col in cols) + tag)
         med = c.get("median", {})
         lines.append("    " + f"{'median':<22}" + "".join(cell(med.get(col)) for col in cols))
@@ -701,7 +812,7 @@ async def main(requests_list: list[dict]) -> str:
 
         w = result.get("viewer_weather")
         if w:
-            lines.append(f"\n── Surface Weather ──")
+            lines.append(f"\n── Surface Weather ({w.get('source', PRODUCTION_SOURCE)}) ──")
             lines.append(f"  Temperature:       {w['temp_c']}°C  (feels like {w['apparent_temp_c']}°C)")
             lines.append(f"  Dewpoint:          {w['dewpoint_c']}°C")
             lines.append(f"  Humidity:          {w['humidity_pct']}%")
@@ -714,12 +825,15 @@ async def main(requests_list: list[dict]) -> str:
 
         c = result.get("viewer_clouds")
         if c:
-            lines.append(f"\n── Clouds at Viewer ({c.get('source', FORECAST_MODEL)}) ──")
-            lines.append(f"  Low (<3 km):       {c['low_pct']}%")
-            lines.append(f"  Mid (3–8 km):      {c['mid_pct']}%")
-            lines.append(f"  High (>8 km):      {c['high_pct']}%")
+            st = c.get("station") or {}
+            lines.append(f"\n── Clouds at Viewer ({c.get('source', PRODUCTION_SOURCE)}) ──")
             lines.append(f"  Total cover:       {c['total_pct']}%")
-            lines.append(f"  Cloud types:       {', '.join(c['types'])}")
+            lines.append(f"  Coverage:          {', '.join(c['types'])}")
+            lines.append(f"  Vertical split:    n/a — DWD MOSMIX reports total cloud only")
+            if st.get("name"):
+                lines.append(
+                    f"  MOSMIX station:    {st.get('name')} "
+                    f"(WMO {st.get('wmo_id')}, {round(st['distance_m']) if st.get('distance_m') is not None else '?'} m away)")
 
         aq = result.get("air_quality")
         if aq:
@@ -737,7 +851,7 @@ async def main(requests_list: list[dict]) -> str:
         else:
             lines.append(f"\n  [air quality: not available for past dates]")
 
-        src = (result.get("viewer_clouds") or {}).get("source", FORECAST_MODEL)
+        src = (result.get("viewer_clouds") or {}).get("source", PRODUCTION_SOURCE)
         lines.append(f"\n── Cloud Cover Along Sunset Azimuth ({src}) ──")
         for pt in result["points"]:
             c = pt["clouds"]
@@ -747,13 +861,12 @@ async def main(requests_list: list[dict]) -> str:
                 types_str = ", ".join(c["types"])
                 lines.append(
                     f"  [{pt['point_index']}] {pt['distance_m']:6d}m  ->  "
-                    f"low={c['low_pct']}%  mid={c['mid_pct']}%  high={c['high_pct']}%  "
                     f"total={c['total_pct']}%  |  {types_str}"
                 )
 
-    # The forecast text sent to Telegram is ICON-only (built above). The full 6-model
+    # The forecast text sent to Telegram is DWD MOSMIX (built above). The full multi-model
     # comparison is printed to the logs here, but deliberately NOT folded into
-    # forecast_str so the written forecast stays based solely on ICON.
+    # forecast_str so the written forecast stays based solely on DWD.
     forecast_str = "\n".join(lines)
     print(forecast_str)
     for result in results:
